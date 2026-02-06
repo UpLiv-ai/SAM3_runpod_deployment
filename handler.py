@@ -1,186 +1,168 @@
 import runpod
 import torch
+import base64
 import io
 import os
-import sys
-import argparse
 import numpy as np
-import requests # New dependency
-from PIL import Image, ImageOps 
-from sam3.model_builder import build_sam3_image_model
-from sam3.model.sam3_image_processor import Sam3Processor
+import requests
+from PIL import Image, ImageOps
+from transformers import Sam3Processor, Sam3Model
 
 # --- Configuration ---
-# Use the Network Volume path if set, otherwise fallback
-if os.path.exists('/runpod-volume'):
-    base_volume_path = '/runpod-volume'
-else:
-    base_volume_path = '/workspace'
-
-MODEL_DIR = os.path.join(base_volume_path, "models", "sam3")
+MODEL_PATH = "/workspace/models/sam3"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# --- Global Model Storage ---
 model = None
 processor = None
 
 def init_model():
-    """Initializes the model using LOCAL weights only."""
     global model, processor
     if model is not None:
         return
-
-    print(f"--- Initializing SAM 3 on {device} ---")
-    
-    checkpoint_file = os.path.join(MODEL_DIR, "sam3.pt")
-    print(f"Loading checkpoint from: {checkpoint_file}")
-
-    if not os.path.exists(checkpoint_file):
-        raise FileNotFoundError(f"Missing checkpoint file: {checkpoint_file}")
-
     try:
-        # Load model using the 'checkpoint_path' argument
-        model = build_sam3_image_model(checkpoint_path=checkpoint_file)
-        model.to(device)
-        processor = Sam3Processor(model)
-        print("SAM 3 Model loaded successfully from local storage.")
-
+        model = Sam3Model.from_pretrained(
+            MODEL_PATH, 
+            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+            low_cpu_mem_usage=True,
+            use_safetensors=True
+        ).to(device)
+        processor = Sam3Processor.from_pretrained(MODEL_PATH)
+        print("✅ SAM 3 Model loaded successfully.")
     except Exception as e:
-        print(f"CRITICAL: Failed to load SAM 3 Model: {e}")
+        print(f"❌ CRITICAL: Failed to load model: {e}")
         raise e
-
-# --- Helper Functions ---
-
-def download_image_from_url(url):
-    """Downloads image from URL and fixes rotation."""
-    try:
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
-        
-        image = Image.open(io.BytesIO(response.content))
-        
-        # CRITICAL: Fix rotation metadata (EXIF)
-        image = ImageOps.exif_transpose(image)
-        
-        return image.convert("RGB")
-    except Exception as e:
-        raise Exception(f"Failed to download image: {str(e)}")
 
 def upload_mask_to_azure(pil_image, upload_url):
     """Uploads the binary mask to Azure Blob Storage via SAS URL."""
     try:
-        # Convert PIL image to bytes
         buffer = io.BytesIO()
         pil_image.save(buffer, format="PNG")
         buffer.seek(0)
         image_data = buffer.getvalue()
 
-        # Azure Blob Storage typically requires this header for PUT uploads
         headers = {
             'x-ms-blob-type': 'BlockBlob',
             'Content-Type': 'image/png'
         }
-
         response = requests.put(upload_url, data=image_data, headers=headers, timeout=60)
         response.raise_for_status()
-        print("Upload successful.")
         return True
     except Exception as e:
-        raise Exception(f"Failed to upload output to Azure: {str(e)}")
+        print(f"Failed to upload: {str(e)}")
+        return False
 
-# --- Serverless Handler ---
+def decode_base64_image(base64_string):
+    if "," in base64_string:
+        base64_string = base64_string.split(",")[1]
+    image_data = base64.b64decode(base64_string)
+    image = Image.open(io.BytesIO(image_data))
+    image = ImageOps.exif_transpose(image) 
+    return image.convert("RGB")
+
+def process_mask_only(image_data_b64, prompt_text, bbox, threshold, mask_threshold):
+    """Performs inference and returns a PIL mask."""
+    image = decode_base64_image(image_data_b64)
+    input_boxes = [[bbox]] if bbox else None
+
+    inputs = processor(
+        images=image, 
+        text=prompt_text,
+        input_boxes=input_boxes, 
+        return_tensors="pt"
+    ).to(device)
+    
+    for key in inputs:
+        if inputs[key].dtype == torch.float32:
+            inputs[key] = inputs[key].to(model.dtype)
+    
+    with torch.no_grad():
+        outputs = model(**inputs)
+    
+    results = processor.post_process_instance_segmentation(
+        outputs,
+        threshold=threshold,
+        mask_threshold=mask_threshold,
+        target_sizes=inputs.get("original_sizes").tolist()
+    )[0]
+    
+    masks = results['masks']
+    if len(masks) == 0:
+         return None
+
+    # Combine Masks (Union)
+    all_masks_np = masks.cpu().numpy().astype(bool)
+    combined_mask_np = np.any(all_masks_np, axis=0)
+    
+    mask_uint8 = (combined_mask_np * 255).astype(np.uint8)
+    return Image.fromarray(mask_uint8, mode='L')
 
 def handler(job):
     job_input = job.get("input", {})
+    images_input = job_input.get("images", {})
+    output_locations = job_input.get("output_locations", {})
     
-    # 1. Input Parsing
-    image_url = job_input.get("image_url")
-    description = job_input.get("description")
-    output_location = job_input.get("output_location")
-
-    # Basic Validation
-    if not image_url:
-        return {"status": "error", "error_message": "Missing 'image_url' in input."}
-    if not description:
-        return {"status": "error", "error_message": "Missing 'description' in input."}
-    if not output_location:
-        return {"status": "error", "error_message": "Missing 'output_location' in input."}
+    if not images_input or not output_locations:
+        return {"status": "error", "message": "Missing 'images' or 'output_locations'."}
 
     try:
-        # 2. Ensure model is loaded
         init_model()
         
-        # 3. Download and Preprocess
-        image = download_image_from_url(image_url)
+        prompt_text = job_input.get("prompt_text", "object")
+        threshold = job_input.get("threshold", 0.3) 
+        mask_threshold = job_input.get("mask_threshold", 0.5)
+        bboxes_input = job_input.get("bboxes", {})
         
-        # 4. Inference
-        inference_state = processor.set_image(image)
-        results = processor.set_text_prompt(state=inference_state, prompt=description)
+        generated_masks = {}
         
-        masks = results.get("masks")
-        if masks is None or len(masks) == 0:
-            return {"status": "error", "error_message": "No objects found matching description."}
-
-        # 5. Mask Processing (Combine masks into one binary image)
-        combined_mask = np.zeros((image.height, image.width), dtype=bool)
-        
-        for mask_tensor in masks:
-            if isinstance(mask_tensor, torch.Tensor):
-                mask_np = mask_tensor.cpu().numpy().squeeze()
+        # 1. GENERATION PHASE
+        for name, b64_data in images_input.items():
+            bbox = bboxes_input.get(name)
+            mask_pil = process_mask_only(b64_data, prompt_text, bbox, threshold, mask_threshold)
+            
+            if mask_pil:
+                generated_masks[name] = mask_pil
             else:
-                mask_np = mask_tensor
-            combined_mask = np.logical_or(combined_mask, mask_np > 0)
+                print(f"⚠️ No mask generated for {name}")
 
-        # Convert to Uint8 (0 vs 255)
-        mask_uint8 = (combined_mask * 255).astype(np.uint8)
-        mask_pil = Image.fromarray(mask_uint8, mode='L')
+        # --- MEMORY CLEANUP ---
+        # Freeing up VRAM before starting network tasks
+        if device == "cuda":
+            torch.cuda.empty_cache()
 
-        # 6. Upload Result
-        upload_mask_to_azure(mask_pil, output_location)
-        
-        # 7. Return Success
-        return {
-            "status": "success",
-            "message": "Mask generated and uploaded successfully."
-        }
+        # 2. BATCH UPLOAD PHASE
+        failed_uploads = []
+        successful_count = 0
+
+        for name, mask_pil in generated_masks.items():
+            azure_url = output_locations.get(name)
+            if not azure_url:
+                failed_uploads.append(f"{name} (No URL provided)")
+                continue
+                
+            if upload_mask_to_azure(mask_pil, azure_url):
+                successful_count += 1
+            else:
+                failed_uploads.append(name)
+
+        # 3. RESPONSE LOGIC
+        if len(failed_uploads) == 0 and successful_count > 0:
+            return {
+                "status": "success",
+                "message": f"All {successful_count} masks uploaded successfully."
+            }
+        elif successful_count > 0:
+            return {
+                "status": "partial_success",
+                "message": f"Uploaded {successful_count} masks, but failed on: {', '.join(failed_uploads)}"
+            }
+        else:
+            return {
+                "status": "error",
+                "message": "No masks were successfully uploaded.",
+                "details": failed_uploads
+            }
 
     except Exception as e:
-        print(f"Error processing job: {e}")
-        return {
-            "status": "error", 
-            "error_message": str(e)
-        }
+        return {"status": "error", "message": str(e)}
 
 runpod.serverless.start({"handler": handler})
-
-# # --- Local Testing Block (Updated for URL inputs) ---
-# if __name__ == "__main__":
-#     # To test this locally, you need real URLs or you need to mock the requests.
-#     print("--- Running Local Test Mode ---")
-    
-#     # Mock job input
-#     test_job = {
-#         "input": {
-#             "image_url": "https://raw.githubusercontent.com/facebookresearch/segment-anything/main/notebooks/images/truck.jpg", # Public test image
-#             "description": "truck",
-#             "output_location": "MOCK_UPLOAD" # This will fail the upload step if not a real SAS URL
-#         }
-#     }
-    
-#     # We override the upload function for local testing to save to disk instead
-#     def mock_upload(pil_image, url):
-#         print(f"Simulating upload to {url}...")
-#         pil_image.save("local_test_mask.png")
-#         print("Saved locally to local_test_mask.png instead.")
-    
-#     # Swap the function just for this test run
-#     original_upload_func = upload_mask_to_azure
-#     upload_mask_to_azure = mock_upload
-    
-#     # Run
-#     init_model()
-#     result = handler(test_job)
-#     print("Result:", result)
-    
-# else:
-#     runpod.serverless.start({"handler": handler})
