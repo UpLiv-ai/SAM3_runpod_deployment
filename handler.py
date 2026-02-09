@@ -1,6 +1,5 @@
 import runpod
 import torch
-import base64
 import io
 import os
 import numpy as np
@@ -51,21 +50,29 @@ def upload_mask_to_azure(pil_image, upload_url):
         print(f"Failed to upload: {str(e)}")
         return False
 
-def decode_base64_image(base64_string):
-    if "," in base64_string:
-        base64_string = base64_string.split(",")[1]
-    image_data = base64.b64decode(base64_string)
-    image = Image.open(io.BytesIO(image_data))
-    image = ImageOps.exif_transpose(image) 
-    return image.convert("RGB")
+def download_image_from_url(url):
+    """Downloads image from URL and fixes rotation."""
+    try:
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        
+        image = Image.open(io.BytesIO(response.content))
+        
+        # CRITICAL: Fix rotation metadata (EXIF)
+        image = ImageOps.exif_transpose(image)
+        
+        return image.convert("RGB")
+    except Exception as e:
+        print(f"Failed to download image from {url}: {str(e)}")
+        return None
 
-def process_mask_only(image_data_b64, prompt_text, bbox, threshold, mask_threshold):
+def process_mask_only(pil_image, prompt_text, bbox, threshold, mask_threshold):
     """Performs inference and returns a PIL mask."""
-    image = decode_base64_image(image_data_b64)
+    
     input_boxes = [[bbox]] if bbox else None
 
     inputs = processor(
-        images=image, 
+        images=pil_image, 
         text=prompt_text,
         input_boxes=input_boxes, 
         return_tensors="pt"
@@ -98,11 +105,21 @@ def process_mask_only(image_data_b64, prompt_text, bbox, threshold, mask_thresho
 
 def handler(job):
     job_input = job.get("input", {})
-    images_input = job_input.get("images", {})
-    output_locations = job_input.get("output_locations", {})
     
-    if not images_input or not output_locations:
-        return {"status": "error", "message": "Missing 'images' or 'output_locations'."}
+    # 1. PARSE LIST INPUTS
+    image_urls = job_input.get("image_urls", [])
+    output_locations = job_input.get("output_locations", [])
+    bboxes_input = job_input.get("bboxes", [])
+    
+    # Validation
+    if not isinstance(image_urls, list) or not isinstance(output_locations, list):
+         return {"status": "error", "message": "'image_urls' and 'output_locations' must be lists."}
+         
+    if len(image_urls) == 0:
+        return {"status": "error", "message": "No images provided."}
+
+    if len(image_urls) != len(output_locations):
+        return {"status": "error", "message": f"Mismatch: Received {len(image_urls)} images but {len(output_locations)} output locations."}
 
     try:
         init_model()
@@ -110,42 +127,45 @@ def handler(job):
         prompt_text = job_input.get("prompt_text", "object")
         threshold = job_input.get("threshold", 0.3) 
         mask_threshold = job_input.get("mask_threshold", 0.5)
-        bboxes_input = job_input.get("bboxes", {})
         
-        generated_masks = {}
+        generated_results = [] # Stores (index, mask_pil)
+        failed_items = []
         
-        # 1. GENERATION PHASE
-        for name, b64_data in images_input.items():
-            bbox = bboxes_input.get(name)
-            mask_pil = process_mask_only(b64_data, prompt_text, bbox, threshold, mask_threshold)
+        # 2. GENERATION PHASE
+        for i, url in enumerate(image_urls):
+            # Get corresponding bbox if it exists in the list, else None
+            bbox = bboxes_input[i] if (isinstance(bboxes_input, list) and i < len(bboxes_input)) else None
             
-            if mask_pil:
-                generated_masks[name] = mask_pil
+            pil_image = download_image_from_url(url)
+            
+            if pil_image:
+                mask_pil = process_mask_only(pil_image, prompt_text, bbox, threshold, mask_threshold)
+                
+                if mask_pil:
+                    generated_results.append((i, mask_pil))
+                else:
+                    print(f"⚠️ No mask generated for image index {i}")
             else:
-                print(f"⚠️ No mask generated for {name}")
+                failed_items.append(f"Index {i} (Download Failed)")
+                print(f"⚠️ Skipping index {i} due to download failure.")
 
         # --- MEMORY CLEANUP ---
-        # Freeing up VRAM before starting network tasks
         if device == "cuda":
             torch.cuda.empty_cache()
 
-        # 2. BATCH UPLOAD PHASE
-        failed_uploads = []
+        # 3. BATCH UPLOAD PHASE
         successful_count = 0
 
-        for name, mask_pil in generated_masks.items():
-            azure_url = output_locations.get(name)
-            if not azure_url:
-                failed_uploads.append(f"{name} (No URL provided)")
-                continue
-                
-            if upload_mask_to_azure(mask_pil, azure_url):
+        for i, mask_pil in generated_results:
+            upload_url = output_locations[i]
+            
+            if upload_mask_to_azure(mask_pil, upload_url):
                 successful_count += 1
             else:
-                failed_uploads.append(name)
+                failed_items.append(f"Index {i} (Upload Failed)")
 
-        # 3. RESPONSE LOGIC
-        if len(failed_uploads) == 0 and successful_count > 0:
+        # 4. RESPONSE LOGIC
+        if len(failed_items) == 0 and successful_count > 0:
             return {
                 "status": "success",
                 "message": f"All {successful_count} masks uploaded successfully."
@@ -153,13 +173,13 @@ def handler(job):
         elif successful_count > 0:
             return {
                 "status": "partial_success",
-                "message": f"Uploaded {successful_count} masks, but failed on: {', '.join(failed_uploads)}"
+                "message": f"Uploaded {successful_count} masks, but failed on: {', '.join(failed_items)}"
             }
         else:
             return {
                 "status": "error",
                 "message": "No masks were successfully uploaded.",
-                "details": failed_uploads
+                "details": failed_items
             }
 
     except Exception as e:
