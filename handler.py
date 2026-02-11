@@ -8,7 +8,7 @@ from PIL import Image, ImageOps
 from transformers import Sam3Processor, Sam3Model
 
 # --- Configuration --- #
-MODEL_PATH = "/workspace/models/sam3"
+MODEL_PATH = "/runpod-volume/models/sam3"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 model = None
