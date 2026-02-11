@@ -28,6 +28,9 @@ WORKDIR /app/sam3
 # Install in editable mode to ensure all deps are resolved
 RUN pip install -e.
 
+RUN pip install einops decord
+RUN pip install git+https://github.com/huggingface/transformers accelerate
+
 # 4. Setup Handler
 COPY handler.py /app/handler.py
 
